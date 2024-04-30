@@ -69,30 +69,27 @@ extension Publisher {
 }
 
 public enum DiamondDebounceState {
-    fileprivate static let updateQueue: ThreadLocal<[(generation: UInt64, update: () -> Void)]?> = .init(nil)
+    @TaskLocal fileprivate static var updateQueue: UpdateQueue?
 
     /// Enable the diamond graph debouncing implemented in `DiamondDebounce` for the duration of
     /// this block. This is a thread-local state, so will apply to all stages of the `Publisher`
     /// graph that execute immediately on the same thread. Use this around any code that causes
     /// values to be published to the `Publisher` graph that uses `DiamondDebounce`.
     public static func doUpdate<Result>(_ block: () -> Result) -> Result {
-        guard updateQueue.value == nil else {
+        guard updateQueue == nil else {
             return block()
         }
 
-        updateQueue.value = []
+        let queue = UpdateQueue()
+        return $updateQueue.withValue(queue) {
+            let result = block()
 
-        let result = block()
+            while let updateHandler = queue.removeOldest() {
+                updateHandler()
+            }
 
-        while true {
-            guard let queue = updateQueue.value, let index = queue.enumerated().min(by: { $0.element.generation < $1.element.generation })?.offset else { break }
-            let (_, updateHandler) = queue[index]
-            self.updateQueue.value?.remove(at: index)
-            updateHandler()
+            return result
         }
-
-        updateQueue.value = nil
-        return result
     }
 
     static let currentGeneration: Locked<UInt64> = .init(0)
@@ -101,6 +98,24 @@ public enum DiamondDebounceState {
         return currentGeneration.withValue { value in
             value += 1
             return value
+        }
+    }
+
+    // This is @unchecked Sendable because it is only ever stored in a @TaskLocal var,
+    // so it can only ever be accessed from a single Task.
+    fileprivate final class UpdateQueue: @unchecked Sendable {
+        private var callbacks: [(generation: UInt64, update: () -> Void)] = []
+
+        func append(generation: UInt64, update: @escaping () -> Void) {
+            callbacks.append((generation: generation, update: update))
+        }
+
+        func removeOldest() -> (() -> Void)? {
+            guard let (index, (_, updateHandler)) = callbacks.enumerated().min(by: { $0.element.generation < $1.element.generation }) else {
+                return nil
+            }
+            callbacks.remove(at: index)
+            return updateHandler
         }
     }
 }
@@ -224,15 +239,15 @@ extension Publishers {
                 // out of order, and we have to handle the case where downstream may have run out of demand.
                 if upstreamDemand > 0 { upstreamDemand -= 1 }
 
-                if DiamondDebounceState.updateQueue.value != nil {
+                if let queue = DiamondDebounceState.updateQueue {
                     if latestInput == nil {
                         // If this is the first debounced value, register a callback in the queue of updates needed.
                         // This will be called back later when it is safe to propagate the value.
-                        DiamondDebounceState.updateQueue.value?.append((generation: generation, update: { [weak self] in
+                        queue.append(generation: generation, update: { [weak self] in
                             guard let self, let latestInput = self.latestInput else { return }
                             self.latestInput = nil
                             send(output: latestInput)
-                        }))
+                        })
                     }
                     latestInput = input
 
@@ -278,34 +293,6 @@ extension Publishers {
             func receive(completion: Subscribers.Completion<Failure>) {
                 downstream.receive(completion: completion)
             }
-        }
-    }
-}
-
-/// A thread-local static value. This value will look the same to code running within a given
-/// thread, but other threads have their own version of it. Should only be used on static vars.
-public struct ThreadLocal<Value>: @unchecked Sendable {
-    private let defaultValue: () -> Value
-    private let name: String
-
-    public init(_ value: @autoclosure @escaping () -> Value) {
-        self.defaultValue = value
-        self.name = UUID().uuidString
-    }
-
-    public var value: Value {
-        get {
-            if let value = Thread.current.threadDictionary[name] as? Value {
-                return value
-            } else {
-                let value = defaultValue()
-                Thread.current.threadDictionary[name] = value
-                return value
-            }
-        }
-
-        nonmutating set {
-            Thread.current.threadDictionary[name] = newValue
         }
     }
 }
