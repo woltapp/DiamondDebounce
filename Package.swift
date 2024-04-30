@@ -16,7 +16,7 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(path: "../Locked")
+        .package(url: "https://github.com/woltapp/Locked", exact: "0.1.0"),
     ],
     targets: [
         .target(
@@ -25,8 +25,8 @@ let package = Package(
                 "Locked"
             ],
             swiftSettings: [
-                .unsafeFlags(["-Xfrontend", "-strict-concurrency=complete"])
-            ]
+			    .enableExperimentalFeature("StrictConcurrency")
+			]
         ),
         .testTarget(
             name: "DiamondDebounceTests",
